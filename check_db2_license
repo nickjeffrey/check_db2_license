@@ -1,0 +1,295 @@
+#!/usr/bin/perl -w
+
+
+
+# CHANGE LOG
+# ----------
+#  2014/04/10   njeffrey    Script created
+#  2014/04/25   njeffrey    Show all installed DB2 products in message output
+#  2014/04/25   njeffrey    Add enhancement to ignore "DB2 Connect Server" - DB2 Enterprise automatically installs a trial version
+
+
+# OUTSTANDING TASKS
+# -----------------
+#  This script will alert on the first expired DB2 product,
+#  but will not tell you if there are multiple expired products.
+#  This usually is not a problem, as all the DB2 products usually expire on the same date.
+
+
+
+# Nagios plugin for performing check of DB2 license status 
+#
+#
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+# 
+#  The line of output will become the body of the alert message sent by nagios
+#
+#  This script will attempt to execute the "db2licm" command, which is not normally in the path,
+#  because it resides under an instance-specific subdirectory of the DB2 instance name.
+#  Since different servers will have different DB2 instance names, we ask the user to provide the 
+#  full /path/to/db2licm as a command line parameter.
+
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-24x7-service
+#              host_name                       db2server01
+#              service_description             DB2 license status
+#              normal_check_interval           1440         ; Check the service every 1440 minutes (once per day) under normal conditions
+#              check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_db2_license /path/to/db2licm"
+#              }
+#
+#
+#  Alternatively, if you are using the NRPE method, you should have a section similar to the following in
+#  the services.cfg file:
+#      define service{
+#               use                             generic-24x7-service
+#               host_namel                      db2server01
+#               service_description             DB2 license status
+#               check_command                   check_nrpe!check_db2_license!/path/to/db2licm
+#               notification_options            c,r                 ; Send notifications about critical and recovery events
+#  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
+#  in the /usr/local/nagios/nrpe/nrpe.cfg file:
+#      command[check_db2_license]=/usr/local/nagios/libexec/check_db2_license
+#
+#
+
+
+
+
+# TROUBLESHOOTING
+# ---------------
+#
+# If you get a "Remote command execution failed" error from nagios, it probably means
+# the permissions on the /path/to/db2licm file are too restrictive
+#
+
+
+use strict;                                             #enforce good coding practices
+
+
+# define variables
+my ($CHECK_NAME,$OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($verbose,$db2licm,$ls,$sudo,$sudoers,%db2,$counter,$key,$message,$ignore_db2_connect);
+$verbose            = "no";				#yes/no flag to increase verbosity during debugging
+$db2licm            = ""; 				#location of db2licm binary
+$counter            = "";				#integer used as primary key in hash
+$key                = "";				#used for looping through hash keys
+$message            = "";				#string to hold message output
+$ignore_db2_connect = "yes"; 				#yes/no flag to ignore the trial version of DB2 Connect Server
+
+#define name of nagios check
+$CHECK_NAME="DB2_LICENSE";
+
+
+
+
+# Nagios return codes - this script returns a value to nagios for processing
+#
+$OK=0;
+$WARN=1;
+$CRITICAL=2;
+$UNKNOWN=3;
+
+
+
+
+sub sanity_checks {
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm that a command line parameter was provided 
+   if( ! defined( $ARGV[0] ) ) {                				#check for command line parameter
+      print "$CHECK_NAME UNKNOWN - please provide full path to db2licm binary.  Example: $0 /path/to/db2licm \n";
+      exit $UNKNOWN; 	                         				#exit script
+   }										#end of if block
+   # 
+   $db2licm = $ARGV[0]; 							#assign command line parameter to variable name
+   if ( ! -f $db2licm ) {
+      print "$CHECK_NAME WARN - cannot find $db2licm as provided by command line parameter.  Please confirm path to db2licm file. \n";
+      exit $WARN;
+   }
+   if ( ! -r $db2licm ) {
+      print "$CHECK_NAME WARN - $db2licm is not readable by current user. Try running this commands chmod o+r $db2licm \n";
+      exit $WARN;
+   }
+   if ( ! -x $db2licm ) {
+      print "$CHECK_NAME WARN - $db2licm is not executable by current user. Try running this command: chmod o+x $db2licm \n";
+      exit $WARN;
+   }
+}										#end of subroutine
+
+
+
+
+
+sub get_db2_license_status {
+   #
+   print "running get_db2_license_status \n" if ($verbose eq "yes");
+   #
+   #
+   # Output similar to the following is expected:
+   #   Product name:                     "DB2 Enterprise Server Edition"
+   #   Expiry date:                      "Expired"
+   #   Product identifier:               "db2ese"
+   #   Version information:              "9.7"
+   #   Enforcement policy:               "Soft Stop"
+   #
+   #   Product name:                     "DB2 Connect Server"
+   #   Expiry date:                      "Expired"
+   #   Product identifier:               "db2consv"
+   #   Version information:              "9.7"
+   #   Concurrent connect user policy:   "Disabled"
+   #   Enforcement policy:               "Soft Stop"
+   #
+   #
+   #   Product name:                     "DB2 Enterprise Server Edition"
+   #   License type:                     "Trial"
+   #   Expiry date:                      "04/09/2014"
+   #   Product identifier:               "db2ese"
+   #   Version information:              "9.7"
+   #
+   #   Product name:                     "DB2 Connect Server"
+   #   License type:                     "Trial"
+   #   Expiry date:                      "04/09/2014"
+   #   Product identifier:               "db2consv"
+   #   Version information:              "9.7"
+   #
+   #
+   #   Product name:                     "DB2 Enterprise Server Edition"
+   #   License type:                     "Restricted"
+   #   Expiry date:                      "Permanent"
+   #   Product identifier:               "db2ese"
+   #   Version information:              "9.7"
+   #
+   #   Product name:                     "DB2 Enterprise Server Edition"
+   #   License type:                     "CPU Option"
+   #   Expiry date:                      "Permanent"
+   #   Product identifier:               "db2ese"
+   #   Version information:              "9.7"
+   #   Enforcement policy:               "Soft Stop"
+   #   Features:
+   #   DB2 Database Partitioning:        "Licensed"
+   #   DB2 Performance Optimization ESE: "Licensed"
+   #   DB2 Storage Optimization:         "Licensed"
+   #   DB2 Advanced Access Control:      "Not licensed"
+   #   DB2 Geodetic Data Management:     "Not licensed"
+   #   IBM Homogeneous Replication ESE:  "Not licensed"
+   #
+   $counter = 1; 					#start hash keys at 1 instead of 0 because "foreach keys" will ignore 0
+   open (IN,"$db2licm -l |");            					#open filehandle using command output
+   while (<IN>) {								#read a line from filehandle output
+      if ( /^Product name: +\"([A-Za-z0-9 ]+)\"/ ){				#regex to find Product name
+         $db2{$counter}{product_name}        = $1;				#add value to hash
+         print "   found Product name: $1 \n" if ($verbose eq "yes");		#verbose output for debugging
+      }										#end of if block
+      if ( /^License type: +\"([A-Za-z]+)\"/       ) {				#regex to find License type
+         $db2{$counter}{license_type}        = $1;				#add value to hash
+         print "   found License type: $1 \n" if ($verbose eq "yes");		#verbose output for debugging
+      }										#end of if block
+      if ( /^Expiry date: +\"([A-Za-z0-9\/]+)\"/   ) {				#regex to find Expiry date
+         $db2{$counter}{expiry_date}         = $1;				#add value to hash
+         print "   found Expiry date: $1 \n" if ($verbose eq "yes");		#verbose output for debugging
+      }										#end of if block
+      if ( /^Product identifier: +\"([A-Za-z]+)\"/ ) {				#regex to find Product identifier
+         $db2{$counter}{product_identifier}  = $1;				#add value to hash
+         print "   found Product identifier: $1 \n" if ($verbose eq "yes");	#verbose output for debugging
+      }										#end of if block
+      if ( /^Version information: +\"([0-9\.]+)\"/ ) {				#regex to find Version information
+         $db2{$counter}{version_information} = $1;				#add value to hash
+         print "   found Version information: $1 \n" if ($verbose eq "yes");	#verbose output for debugging
+      }										#end of if block
+      if ( /^Enforcement policy: +\"([A-Za-z ]+)\"/ ) {				#regex to find Enforcement policy
+         $db2{$counter}{enforcement_policy} = $1;				#add value to hash
+         print "   found Enforcement policy: $1 \n" if ($verbose eq "yes");	#verbose output for debugging
+      }										#end of if block
+      unless ( /:/ ) {								#regex to find lines without a colon (ie blank line)
+         $counter++; 								#increment counter used as hash key
+         print "   found blank line counter=$counter\n" if ($verbose eq "yes"); #verbose output for debugging
+      }										#end of unless block
+   } 										#end of while loop
+   close IN;									#close filehandle
+   #
+   #
+   # The DB2 Enterprise Server installation will automatically install a trial copy of DB2 Connect Server.
+   # In most cases, we don't need or want the DB2 Connect Server, so it is safe to ignore.
+   if ( $ignore_db2_connect eq "yes" ) {
+      foreach $key (sort keys %db2) {                   			#loop through for each licensed product
+         if ( $db2{$key}{product_name} eq "DB2 Connect Server" ) {		#look for yes/no flag
+            delete $db2{$key}{product_name};					#delete hash value
+            delete $db2{$key}{expiry_date};					#delete hash value
+         } 										#end of if block
+      } 											#end of foreach loop
+   }										#end of if block
+}										#end of subroutine
+
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # If there are any "Permanent" DB2 licenses, change the value in the hash
+   # from "Permanent" to "never (Permanent license)" just to make the grammar
+   # flow nicely in the output message.
+   foreach $key (sort keys %db2) {                   					#loop through for each licensed product
+      next unless $key;                      	       				        #skip any blank lines
+      next unless $db2{$key}{expiry_date};                      			#skip any hash entries missing an expiry date
+      if ( $db2{$key}{expiry_date} eq "Permanent" ) {
+         $db2{$key}{expiry_date} = "never (Permanent license)";				#change text slightly for grammatical correctness
+      } 										#end of if block
+   } 											#end of foreach loop
+
+
+   # There may be multiple DB2 products installed.
+   # Get all of the DB2 products and their expiry dates into a single string.
+   # This will allow us to use the same message for OK/WARN/CRITICAL 
+   foreach $key (sort keys %db2) {                   					#loop through for each licensed product
+      next unless $key;                      	       				        #skip any blank lines
+      next unless $db2{$key}{expiry_date};                      			#skip any hash entries missing an expiry date
+      $message = "$message $db2{$key}{product_name} expiry date:$db2{$key}{expiry_date}. "; #concatenate all the DB2 products into a single var
+   } 											#end of foreach loop
+   #
+
+   # This section only runs if there is an expired product.
+   # You may note that we put the name of the expired product first, followed by all the other DB2 products.
+   #
+   foreach $key (sort keys %db2) {                   					#loop through for each licensed product
+      next unless $key;                      	       				        #skip any blank lines
+      next unless $db2{$key}{expiry_date};                      			#skip any hash entries missing an expiry date
+      print "   checking hash key $key \n" if ($verbose eq "yes");
+      print "   checking $db2{$key}{product_name}  expiry:$db2{$key}{expiry_date} \n" if ($verbose eq "yes"); 
+      if ( $db2{$key}{expiry_date} eq "Expired" ) {
+         print "$CHECK_NAME CRITICAL - $db2{$key}{product_name} is expired.  $message  Please check output of $db2licm -l \n";
+         exit $CRITICAL;
+      } 										#end of if block
+   } 											#end of foreach loop
+
+   #
+   # If we get this far, everything should be ok.
+   print "$CHECK_NAME OK - all DB2 licenses ok.  $message \n"; 				
+   exit $OK;										#exit script
+}											#end of subroutine
+
+
+
+
+# ---------------- main body of script -----------------------
+sanity_checks;
+get_db2_license_status;
+print_output;
+
+
